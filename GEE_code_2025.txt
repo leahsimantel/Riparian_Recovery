@@ -1,0 +1,1856 @@
+//// GOOGLE EARTH ENGINE CODE, AUG2025
+//// LEAH SIMANTEL  |  leah.simantel@gmail.com
+
+//// SCRIPT CONTENT:
+//// LANDSAT PIXEL SELECTION USING BUFFERED RIPARIAN ZONE
+//// Assigning covariates to individual LandSat pixels (pre-modeling, pre-thinning)
+////    --> NDVI, burn severity/year, Topographic wetness index,
+////        climatic water deficit, PRISM climate data (precipitation, temperature),
+////        AET, HUC12 subwatershed, Stream info (FCODE, Stream Name), 
+////        TerraClimate data, pixel_ID, latitude, longitude
+
+// ////////////////////////////////////////////////////////////////////////////
+// 1) LOAD LAYERS AND PRINT RESOLUTIONS, CRS, AND PROJECTIONS - Data exploration
+// ////////////////////////////////////////////////////////////////////////////
+
+// Center the map
+Map.centerObject(severity, 9);
+Map.setOptions('SATELLITE');
+
+// ----- Define reference projection from native Landsat 30 m grid -----
+// (pick any SR band; UTM, 30 m)
+var refProjection = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .first()
+    .select('SR_B5')
+    .projection();
+// print('Reference Landsat projection:', refProjection);
+
+// Check projection of the stream layer:
+// Extract projection from the first feature in the FeatureCollection
+var streamProj = streamNetwork.first().geometry().projection();
+// print('Stream Network Projection:', streamProj);  // crs: EPSG:4326
+// print('Stream Network Properties:', streamNetwork);
+// print('Fire Atlas Properties:', fire_atlas);
+// print('TWI Properties:', twi);
+// print('TWI Projection:', twi.projection());
+
+// print('HLI Properties:', hli)
+// print('HLI Projection:', hli.projection());
+
+var fire_atlasProj = fire_atlas.first().geometry().projection();
+// print('fire_atlasProj', fire_atlasProj);   // crs: EPSG:4326
+
+
+// Severity layer exploration:
+
+// // Print raster metadata
+// print('Sev Raster Metadata:', severity);            // EPSG:4326
+// print('Sev Cannon Properties:', severity_Cannon);   // EPSG:4326
+Map.addLayer(severity_Cannon, {}, 'Severity-Cannon');
+// //Map.addLayer(severity, {}, 'Severity');
+
+// Get projection information
+var sevprojection = severity.projection();
+//print('Severity Projection:', sevprojection);
+
+////////////////////////////////////////////////////////////////////////////
+// 2) FILTER THE STREAM SHAPEFILE FOR PIXEL HARVEST
+////////////////////////////////////////////////////////////////////////////
+
+// huc12 names:
+// 1: Babcock Creek  
+// 2: Upper Youngs Creek  
+// 3: Upper Danaher Creek  
+// 4: Rapic Creek  
+// 5: Lower Youngs Creek  
+// 6: Basin Creek  
+// 7: Upper Gordon Creek  
+// 8: Lower Danaher Creek  
+// 9: Lower Gordon Creek  
+// 10: Bartlett Creek  
+// 11: South Fork River-Burnt Creek  
+// 12: Holbrook Creek  
+// 13: Upper White River  
+// 14: South Fork White River  
+// 15: Middle White River  
+// 16: Upper Big Salmon Creek  
+// 17: Little Salmon Creek  
+// 18: South Fork River-Cayuse Creek  
+// 19: Big Salmon Lake  
+// 20: Black Bear Creek  
+// 21: South Fork Flathead River-Lewis Creek  
+// 22: Wall Creek  
+// 23: Spotted Bear River Headwaters  
+// 24: Silvertip Creek  
+// 25: Middle Spotted Bear River  
+// 26: Gorge Creek  
+// 27: Mid Creek  
+// 28: South Fork Flathead River-Helen Creek  
+// 29: Middle Fork Flathead River-Lower Bunker Creek  
+// 30: Middle Fork Flathead River-Harrison Creek  
+// 31: Lower Spotted Bear River  
+// 32: Lower White River  
+
+//Map.addLayer(huc12, {color: 'black'}, 'huc12');
+
+// Filter the HUC12 polygons by 'name'
+var focalHUC = huc12.filter(ee.Filter.eq('name', 'Bartlett Creek'));
+
+// Filter the streamNetwork to include only streams that intersect the focal HUC12
+var streams_wide = streamNetwork.filterBounds(focalHUC.geometry());
+
+// Apply a buffer to the filtered streams
+var streams_wide = streams_wide.map(function(feature) {
+  return feature.buffer(15);
+});
+
+Map.addLayer(streams_wide, {color: 'yellow'}, 'FocalStream_15m_Buffer');
+
+////////////////////////////////////////////////////////////////////////////
+// 3) CLOUD AND WATER MASKING + PRE-PROCESSING FUNCTIONS
+////////////////////////////////////////////////////////////////////////////
+
+// ============================================================
+// Cloud/Shadow/Snow mask for Landsat surface reflectance
+// ============================================================
+ 
+// Single point of control for NDSI (snow) threshold:
+var NDSI_THRESHOLD = 0.12 // EDIT NDSI (SNOW) THRESHOLD HERE //  *In Gorge Ck, NDSI ranged [-0.3 - 0.15]. Mid: [-.47 to -.01]
+
+// Define function for cloud, shadow, and snow masking Landsat imagery:
+var cloudMask = function(image) {
+  var qa = image.select('QA_PIXEL').toInt();  // Landsat Collection 2 SR bit flags
+
+  var cloudShadow = qa.bitwiseAnd(1 << 3).neq(0);
+  var snow        = qa.bitwiseAnd(1 << 4).neq(0);  // snow option 1 uses QA pixel.
+    // Trying a second approach for snow-masking: NDSI
+    // a) Add NDSI band: (Green - SWIR1) / (Green + SWIR1)
+  var addNDSI = function(image) {
+    var spacecraft = ee.String(image.get('SPACECRAFT_ID'));
+
+    // Dynamically select band names based on sensor
+    var greenBand = ee.Algorithms.If(
+      spacecraft.equals('LANDSAT_8'), 'SR_B3', 'SR_B2'
+    );
+    var swir1Band = ee.Algorithms.If(
+      spacecraft.equals('LANDSAT_8'), 'SR_B6', 'SR_B5'
+    );
+
+    // Compute NDSI with selected bands
+    var ndsi = image.normalizedDifference([greenBand, swir1Band]).rename('NDSI');
+    return image.addBands(ndsi);
+  };
+    // b) Define a snow mask based on NDSI threshold (edit TH above start of function).
+  var refinedSnowMask = function(image) {
+    image = addNDSI(image);
+    var ndsi = image.select('NDSI');
+    return ndsi.lt(NDSI_THRESHOLD);  // Dynamic threshold
+  };
+  
+  var cloud       = qa.bitwiseAnd(1 << 5).neq(0);
+
+  // Only mask shadow if near clouds (within 5 pixels)
+  var cloudBuffer = cloud.focal_max({radius: 5, units: 'pixels'});
+  var shadowNearCloud = cloudShadow.and(cloudBuffer);
+
+  // Final clear mask: not cloud, not snow, not shadow near cloud
+  //var clear = cloud.not().and(snow.not()).and(shadowNearCloud.not());  // snow option 1 (QA pixel)
+  var clear = cloud.not().and(refinedSnowMask(image)).and(shadowNearCloud.not());  // snow option 2 (NDSI)
+
+  // Note on snow masking: QA pixel approach was way too aggressive, even in August imagery. 
+  // Will be opting for NDSI with conservative threshold.
+
+  var optical = image.select('SR_B.').multiply(0.0000275).add(-0.2)  // Scaling for SR
+                    .updateMask(clear);
+
+  return image.addBands(optical, null, true);
+};
+
+
+// // ==== DEFINE A TEST IMAGE TO OBSERVE MASKING EFFECTS ===== //
+var testImage = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterBounds(streams_wide.geometry())
+  .filter(ee.Filter.date('2016-08-01', '2016-08-30'))  // Compare sunny/cloudy times! 
+  .first();
+
+// ==== RE-DEFINE REFPROJECTION TO MATCH THAT OF TEST IMAGE ==== //
+var refProjection = testImage.select('SR_B3').projection();
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// // =====================================================================
+// // Diagnostics for QA-Pixel masking (30-m UTM / refProjection)  - - no NDSI (independent of masking function)
+// // =====================================================================
+
+// ///// How many pixels are being masked out of streams_wide by QA Pixel category?  //////
+// // Extract QA bits and compute bit flags
+// var qa = testImage.select('QA_PIXEL').toInt();
+// var cloudShadowBit = qa.bitwiseAnd(1 << 3).neq(0);  // shadow
+// var snowBit        = qa.bitwiseAnd(1 << 4).neq(0);  // snow (QA bit)
+// var cloudBit       = qa.bitwiseAnd(1 << 5).neq(0);  // cloud
+
+// // Helper to count "true" pixels in a binary mask at 30 m on refProjection
+// function countTrue(maskImg) {
+//   return maskImg.updateMask(maskImg)                // keep only 1's
+//     .rename('mask')
+//     .reduceRegion({
+//       reducer: ee.Reducer.sum(),
+//       geometry: streams_wide.geometry(),
+//       scale: 30,
+//       crs: refProjection.crs(),                     // <-- ensures 30 = 30 meters
+//       maxPixels: 1e13,
+//       tileScale: 4
+//     })
+//     .get('mask');
+// }
+
+// // Total valid pixels in SR_B3 footprint over the region (for % calcs)
+// var validFootprint = testImage.select('SR_B3').mask();  // pixels that exist after QA mask in SR_B3
+// var totalPixels = validFootprint
+//   .gt(0).rename('total')
+//   .reduceRegion({
+//     reducer: ee.Reducer.sum(),
+//     geometry: streams_wide.geometry(),
+//     scale: 30,
+//     crs: refProjection.crs(),
+//     maxPixels: 1e13,
+//     tileScale: 4
+//   })
+//   .get('total');
+
+// // Counts per QA category
+// var shadowCount = countTrue(cloudShadowBit);
+// var snowCount   = countTrue(snowBit);
+// var cloudCount  = countTrue(cloudBit);
+
+// // Package + simple percentages
+// var qaSummary = ee.Dictionary({
+//   total_pixels_30m: totalPixels,
+//   cloud_shadow_true: shadowCount,
+//   snow_true: snowCount,
+//   cloud_true: cloudCount
+// }).combine(ee.Dictionary({
+//   pct_cloud_shadow: ee.Number(shadowCount).divide(totalPixels).multiply(100),
+//   pct_snow:         ee.Number(snowCount).divide(totalPixels).multiply(100),
+//   pct_cloud:        ee.Number(cloudCount).divide(totalPixels).multiply(100)
+// }));
+
+// print('QA bit results: Test Image', qaSummary);
+
+// // ========================================================================
+// // Visual checks for post-cloudMask function: focalHUC geometry (30 m UTM) - - QA Pixel bits.
+// // ========================================================================
+
+// // Bitwise composite (shadow=1, cloud=2, snow=4 => 0..7)
+// var maskComposite = cloudShadowBit
+//   .multiply(1)
+//   .add(cloudBit.multiply(2))
+//   .add(snowBit.multiply(4))
+//   .rename('mask_bits')
+//   .reproject(refProjection);  // ensure tiles rendered on 30 m grid
+
+// Map.addLayer(
+//   maskComposite.clip(focalHUC),
+//   {
+//     min: 0, max: 7,
+//     palette: [
+//       'lightgreen',  // 0 = clear
+//       'orange',      // 1 = shadow only
+//       'red',         // 2 = cloud only
+//       'magenta',     // 3 = shadow + cloud
+//       'cyan',        // 4 = snow only
+//       'blue',        // 5 = shadow + snow
+//       'purple',      // 6 = cloud + snow
+//       'black'        // 7 = cloud + snow + shadow (rare)
+//     ]
+//   },
+//   'Cloud/Shadow/Snow Mask (QA bits, 30 m)'
+// );
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
+// // Valid (retained) pixels after applying cloudMask function to testImage:
+var cloudmaskedImage = cloudMask(testImage);
+
+// SR_B3 has the same mask as all SR bands after cloudMask; use it to visualize retained pixels
+var validMask = cloudmaskedImage
+  .select('SR_B3')
+  .mask()       // 1 where retained, 0 where masked
+  .gt(0)        // make explicit binary
+  .rename('valid_pixels')
+  .reproject(refProjection);
+
+// Map.addLayer(
+//   validMask.clip(focalHUC),
+//   {min: 0, max: 1, palette: ['black', 'white']}, // black=masked, white=retained
+//   'Valid Pixels After Cloud Mask (30 m, no water mask)'
+// );
+
+// ===================================================================
+// //// Pixel removal counts for cloudMask function: streams_wide geometry
+
+// // QA: Count pixels before and after cloud masking
+// var totalPixels = testImage.select('SR_B3').reduceRegion({
+//   reducer: ee.Reducer.count(),
+//   geometry: streams_wide.geometry(),
+//   scale: 30,
+//   crs: refProjection.crs(),   // <- specifying refProjection when reducing Regions ensures 30 = 30 m, instead of degrees
+//   maxPixels: 1e13,
+//   bestEffort: true
+// }).get('SR_B3');
+
+// var remainingPixels = cloudmaskedImage.select('SR_B3').reduceRegion({
+//   reducer: ee.Reducer.count(),
+//   geometry: streams_wide.geometry(),
+//   scale: 30,
+//   crs: refProjection.crs(),   
+//   maxPixels: 1e13,
+//   bestEffort: true
+// }).get('SR_B3');
+
+// var stats = ee.Dictionary({
+//   total: totalPixels,
+//   remaining: remainingPixels,
+//   removed: ee.Number(totalPixels).subtract(remainingPixels),
+//   percent_removed: ee.Number(totalPixels).subtract(remainingPixels)
+//                     .divide(totalPixels)
+//                     .multiply(100)
+// });
+
+// // print('Cloud Masking Summary: streams_wide (testImage only!)', stats);  
+
+// ===================================================================
+/// More cloudMask QA: Where are pixels being flagged as cloud/shadow/snow?
+
+// // See where pixels are flagged as cloudy in the test image. //
+// var cloudBit = qa.bitwiseAnd(1 << 5).neq(0);  // cloud bit
+// Map.addLayer(cloudBit, {min: 0, max: 1, palette: ['black', 'red']}, 'Cloudy Pixels (bit 5)');
+
+// // Where are pixels flagged as cloud shadow in the test image? //
+// var cloudShadowBit = qa.bitwiseAnd(1 << 3).neq(0);
+// Map.addLayer(cloudShadowBit, {min: 0, max: 1, palette: ['black', 'orange']}, 'Cloud Shadow');
+
+// // Where are they flagged as snow in the test image by QA Pixel? //
+// Map.addLayer(snowBit.updateMask(snowBit), {min: 0, max: 1, palette: ['cyan']}, 'Snow Mask (QA Pixel)');
+
+// // // Where are pixels flagged as snow in the test image via NDSI Threshold? // 
+// // Add NDSI band and create binary snow mask using dynamic threshold //
+
+// var ndsiImage = testImage.normalizedDifference(['SR_B3', 'SR_B6']).rename('NDSI');
+// var ndsiSnowMask = ndsiImage.gt(NDSI_THRESHOLD).rename('ndsi_snow');
+// // Add layer: cyan = pixels flagged as snow by NDSI
+// Map.addLayer(ndsiSnowMask.updateMask(ndsiSnowMask), {
+//   min: 0,
+//   max: 1,
+//   palette: ['cyan']
+// }, 'Snow Mask (NDSI > ' + NDSI_THRESHOLD + ')');
+
+// ==============================================================================
+// WATER MASKING: Static occurrence-based JRC mask applied uniformly across years
+// ==============================================================================
+
+// Load the JRC occurrence image (1984–2021), where values are 0–100 (% of valid observations classified as water)
+var jrcOccurrence = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').select('occurrence')
+  .unmask(0);  // Treat missing JRC data (e.g., non-water zones) as 0% water
+
+// // Quick diagnostic on water masking layer: Use this layer to determine appropriate JRC threshold
+// Map.addLayer(jrcOccurrence.clip(focalHUC), {
+//   min: 0,
+//   max: 100,
+//   palette: ['gray', 'blue', 'cyan', 'white']  // white = higher % classified as H20
+// }, 'JRC Water Occurrence (%)');
+
+// Set threshold to define water (e.g., mask pixels where water was present ≥20% of the time)
+var waterThreshold = 15;        // <-- SET JRC THRESHOLD HERE!!!
+var waterMask = jrcOccurrence.gte(waterThreshold)
+                  .and(jrcOccurrence.mask());  // ensures only pixels with valid JRC data are masked
+var landMask = waterMask.not();
+// Visualize which pixels remain after setting water mask threshold (above)
+//   dark blue = water (masked from NDVI)
+//   light gray = land
+// Map.addLayer(waterMask.updateMask(waterMask).clip(focalHUC), {
+//   min: 0,
+//   max: 1,
+//   palette: ['darkblue']
+// }, 'Water Mask (JRC ≥ ' + waterThreshold + '%: darkblue = H20)');
+
+// Define water mask application function
+
+// var applyWaterMask = function(image) {
+//   return image.updateMask(landMask);
+// };
+
+var applyWaterMask = function(image) {
+  var proj = image.select(0).projection();   // the Landsat scene’s native UTM 30m grid
+  // Align the static land mask to the image grid; no resample() needed
+  var landMaskAligned = landMask
+      .unmask(1)                 // treat missing JRC as land so we don't over-mask
+      .reproject({crs: proj});   // snap to the scene grid
+
+  return image.updateMask(landMaskAligned);
+};
+
+// ============================================
+// Band renaming for Landsat 8
+// ============================================
+var bandRenamel8 = function(image) {
+  return image.select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'],
+                      ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7']);
+};
+
+
+/////////////////////////////////////////////////////////////////////
+///// Functions to add fire and HUC12 info from shapefiles:  ////////
+/////////////////////////////////////////////////////////////////////
+
+// Function to add HUC12 name to each pixel
+var addHUC12Name = function(feature) {
+  var huc12Feature = huc12.filterBounds(feature.geometry()).first();
+  var huc12Name = ee.Algorithms.If(
+    huc12Feature, 
+    ee.String(huc12Feature.get('name')), 
+    'None'
+  );
+  return feature.set('huc12', huc12Name);
+};
+
+// Function to add Fire Name, Year, and Size (ha) to each pixel
+var addFireInfo = function(feature) {
+  var fireFeature = fire_atlas.filterBounds(feature.geometry()).first();
+  
+  var fireName = ee.Algorithms.If(
+    fireFeature, 
+    ee.String(fireFeature.get('FireNam')), 
+    'None'
+  );
+
+  var fireYear = ee.Algorithms.If(
+    fireFeature, 
+    ee.Number(fireFeature.get('Fire_Year')), 
+    0
+  );
+
+  var fireSizeHa = ee.Algorithms.If(
+    fireFeature, 
+    ee.Number(fireFeature.get('Size_ha')), 
+    null
+  );
+ 
+  return feature.set({
+    'fire_name': fireName,
+    'fire_year': fireYear,
+    'fire_size_ha': fireSizeHa
+  });
+};
+
+////////////////////////////////////////////////////////////////////////////
+// 4) CREATE LANDSAT IMAGE COLLECTION
+////////////////////////////////////////////////////////////////////////////
+
+////  Confirm projection / scale:
+// var img = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+//             .first();
+// print(img.projection());
+      // output:
+      // Projection
+      // type: Projection
+      // crs: EPSG:32628   // CRS  =   WGS 84 / UTM zone 28N for L8
+      // transform: [30,0,341085,0,-30,8808015]    // Confirms 30m pixel size for LandSat grid
+
+
+// Landsat 5 (1984–2011), August only
+var periodl5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+    .filterBounds(streams_wide.geometry())
+    .filter(ee.Filter.date('1984-01-01', '2011-12-31'))
+    .filter(ee.Filter.calendarRange(8, 8, 'month')) // Only August
+    .map(cloudMask)
+    .map(applyWaterMask);
+
+// Landsat 7 (2012), August only
+var periodl7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+    .filterBounds(streams_wide.geometry())
+    .filter(ee.Filter.date('2012-01-01', '2012-12-31'))
+    .filter(ee.Filter.calendarRange(8, 8, 'month')) // Only August
+    .map(cloudMask)
+    .map(applyWaterMask);
+
+// Landsat 8 (2013–2024), August only.  
+var periodl8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(streams_wide.geometry())
+    .filter(ee.Filter.date('2013-01-01', '2024-12-31')) 
+    .filter(ee.Filter.calendarRange(8, 8, 'month')) // Only August
+    .map(cloudMask)
+    .map(bandRenamel8)
+    .map(applyWaterMask);
+    
+// Merge August Landsat Collections into 'period':
+var period = ee.ImageCollection(periodl5.merge(periodl7).merge(periodl8));
+
+// =================================================================
+// POST-MERGE: Check masking integrity
+// =================================================================
+
+// Apply the August-based water mask on top of the cloud-masked image
+var cloudMasked = cloudMask(testImage);
+var fullMasked = applyWaterMask(cloudMasked);
+
+// Visualize pixels retained after both cloud/snow/shadow and water masking
+var retainedPixels = fullMasked.select('SR_B3').mask().rename('retained');
+// Clip the retainedPixels layer to focalHUC
+var retainedClipped = retainedPixels.clip(focalHUC);
+
+// // Add the retainedPixels layer to the map
+// Map.addLayer(retainedClipped.unmask(0), {
+//   min: 0,   // Visualization palette:   0 = masked (cloud/snow/shadow or water)     → dark blue
+//   max: 1,                            // 1 = retained (valid for NDVI analysis)      → light green
+//   palette: ['darkblue', 'lightgreen']
+// }, 'Valid Pixels (After Cloud + Snow + Water Mask)');
+
+// Map.addLayer(streams_wide, {color: 'white'}, 'Focal Streams');
+
+// // =================================================================
+
+////////////////////////////////////////////////////////////////////////////
+// 5) COMBINE AUGUST LANDSAT COLLECTIONS INTO ANNUAL STACK
+////////////////////////////////////////////////////////////////////////////
+
+// Mosaic the ImageCollection to create a single (stacked) image for the NDVI bands
+var periodMosaicNDVI = period.select(['SR_B4', 'SR_B3']).median();  //using median instead of mosaic to retain masking.
+
+// Calculate the number of 30x30m pixels for the NDVI bands 
+var pixelCountsNDVI = periodMosaicNDVI.reduceRegion({
+  reducer: ee.Reducer.count(),
+  geometry: streams_wide.geometry(), // Restrict to the streams_wide geometry
+  scale: 30,                         // Landsat resolution (30x30 meters)
+  maxPixels: 1e13                    // Handle large numbers of pixels
+});
+
+//Print the pixel counts (in clipped geometry only) for NDVI bands (3,4) to the console
+//print(pixelCountsNDVI);
+
+////////////////////////////////////////////////////////////////////////////
+// 6) CALCULATE NDVI VALUES
+////////////////////////////////////////////////////////////////////////////
+
+// NDVI calculation function
+var ndviCalc = function(x) {
+  return x.normalizedDifference(['SR_B4', 'SR_B3'])
+          .rename('NDVI')
+          .set('system:time_start', x.get('system:time_start'));
+};
+
+// Generate yearly NDVI stacks (LandSat imagery was previously filtered to only August)
+var startYear = 1984;
+var endYear   = 2024;
+
+// Calculate yearly NDVI values (August only) for every pixel using ndviCalc fct.
+var ndvi = period
+  .filter(ee.Filter.date(startYear + '-01-01', endYear + '-12-31'))
+  .select(['SR_B3', 'SR_B4'])
+  .map(ndviCalc);
+
+//Map.addLayer(ndvi, {}, 'ndvi (raw collection)');   // all years
+
+// Quick QA check... display a year of August NDVI values and click on some pixels. 
+//                   Note, the NDVI value will reflect the MEDIAN of however many 'scenes' 
+//                   were available in August of that given year.
+// Map.addLayer(ndvi.filter(ee.Filter.calendarRange(2019, 2019, 'year')).median(),  // Aug 2019 only
+//             {min: 0, max: 1, palette: ['white', 'green']}, 'NDVI 2019');
+            
+// Map.addLayer(ndvi.filter(ee.Filter.calendarRange(2012, 2012, 'year')).median(),  // Aug 2012 only
+//             {min: 0, max: 1, palette: ['white', 'green']}, 'NDVI 2012');
+
+// Generate list of years
+var years = ee.List.sequence(startYear, endYear);
+// print(years, 'Years');
+
+// Generate median NDVI images per August per year
+var ndviAnnualMedian = ee.ImageCollection.fromImages(
+  years.map(function(year) {
+    year = ee.Number(year);
+    var yearCollection = ndvi.filter(ee.Filter.calendarRange(year, year, 'year'));
+    return yearCollection.median()
+            .set('year', year)
+            .set('system:time_start', ee.Date.fromYMD(year, 8, 1));  // Aug 1st
+  })
+);
+// print(ndviAnnualMedian, 'NDVI Median Annual Stack');
+
+// Create an annual stack of median NDVI values:
+var annualStackMedian = ndviAnnualMedian.toBands();
+// Rename bands: use NDVI_<year> format
+var renamedBandNames = years.map(function(year) {
+  return ee.String('NDVI_').cat(ee.Number(year).toInt().format());
+});
+annualStackMedian = annualStackMedian.rename(renamedBandNames);
+
+// =============================================
+// Filter: pixels valid in ALL years (1984–2024)
+// =============================================
+
+// Create a list of all NDVI masks (one per year)
+var allMasks = ndviAnnualMedian.map(function(img) {
+  return img.select('NDVI').mask().rename('mask');
+});
+
+// Reduce to a single image: pixel is valid (1) only if valid in ALL years
+var intersectionMask = ee.ImageCollection(allMasks)
+  .reduce(ee.Reducer.min())  // 1 if valid in *all* years, 0 if invalid in *any*
+  .rename('persistent_valid_pixels');
+
+// Reproject the mask to the LS grid (prevents implicit on-the-fly resampling)
+var intersectionMask30 = intersectionMask.reproject(refProjection);
+
+// Define annualStack and build the final product on the OG Landsat grid
+var annualStack = annualStackMedian
+  .updateMask(intersectionMask30)
+  .clip(streams_wide)
+  .reproject(refProjection);
+
+// ---- Counts of valid(1)/invalid(0) pixels on the same 30 m grid ----
+var mask01 = intersectionMask30
+  .unmask(0)                 // ensure zeros are explicit
+  .reproject(refProjection)  // lock to Landsat grid
+  .rename('valid');
+
+// Histogram of 0/1
+var areaStats = mask01.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: streams_wide.geometry(),
+  scale: 30,
+  crs: refProjection.crs(),
+  maxPixels: 1e13,
+  bestEffort: true
+});
+//print('Pixel validity (0/1) histogram:', areaStats);
+
+// Also compute explicit totals
+var totalPx = ee.Number(
+  ee.Image(1).reproject(refProjection).reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: streams_wide.geometry(),
+    scale: 30,
+    crs: refProjection.crs(),
+    maxPixels: 1e13,
+    bestEffort: true
+  }).get('constant')
+);
+
+var validPx = ee.Number(
+  mask01.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: streams_wide.geometry(),
+    scale: 30,
+    crs: refProjection.crs(),
+    maxPixels: 1e13,
+    bestEffort: true
+  }).get('valid')
+);
+
+var invalidPx = totalPx.subtract(validPx);
+var pctValid  = validPx.divide(totalPx).multiply(100);
+
+// print('Temporal Record Validity summary (1984-2024):', ee.Dictionary({
+//   total_pixels: totalPx,
+//   valid_pixels: validPx,
+//   invalid_pixels: invalidPx,
+//   percent_valid: pctValid
+// }));
+
+// // //---- Visualization (use the reprojected mask) ----
+// Map.addLayer(mask01.clip(streams_wide), {min: 0, max: 1, palette: ['black', 'green']},
+//               'Pixels valid in ALL NDVI years (1984–2024)');
+// Map.addLayer(streams_wide, {color: 'blue'}, 'Streams');
+
+// // =============================================================
+// // FINAL DIAGNOSTIC: Pixels retained after full masking pipeline
+// // =============================================================
+
+// // ===================== QA tallies (30 here means 30 m) =====================
+
+// var preMaskPixels = periodMosaicNDVI.select('SR_B3').reduceRegion({
+//   reducer: ee.Reducer.count(),
+//   geometry: streams_wide.geometry(),
+//   scale: 30,   // meters, because periodMosaicNDVI is Landsat SR
+//   maxPixels: 1e13
+// }).get('SR_B3');
+
+// var postMaskPixels = annualStack.select('NDVI_1984').reduceRegion({
+//   reducer: ee.Reducer.count(),
+//   geometry: streams_wide.geometry(),
+//   scale: 30,   // meters, because annualStack is UTM 30 m
+//   maxPixels: 1e13
+// }).get('NDVI_1984');
+
+// var finalMaskStats = ee.Dictionary({
+//   total: preMaskPixels,
+//   remaining: postMaskPixels,
+//   removed: ee.Number(preMaskPixels).subtract(postMaskPixels),
+//   percent_removed: ee.Number(preMaskPixels).subtract(postMaskPixels)
+//                     .divide(preMaskPixels)
+//                     .multiply(100)
+// });
+
+// // Print to console
+// print('Final Masking Summary (Cloud + Water + Temporal Coverage):', finalMaskStats);
+
+// // ///////////////////////////////////////////////////////////////////////////////////
+// // // 7) (CAN KEEP THIS SECTION COMMENTED OUT- ONLY KEEPING FOR POSTERITY!)
+// // // GENERATE IMAGE COLLECTION FOR AUGUST NDVI ACROSS YEARS 
+// // // CHOOSE BETWEEN USING MEAN NDVI VERSUS MEDIAN NDVI
+// // ///////////////////////////////////////////////////////////////////////////////////
+
+// // // ==== Calculating mean and median NDVI to compare, and choose a metric ==== //
+
+// // // Generate list of years
+// // var years = ee.List.sequence(startYear, endYear);
+// // // print(years, 'Years');
+
+// // // Generate an ImageCollection of mean August NDVI per year
+// // var ndviAnnualMean = ee.ImageCollection.fromImages(
+// //   years.map(function(year) {
+// //     var yearCollection = ndvi.filter(ee.Filter.calendarRange(year, year, 'year'));
+// //     return yearCollection.mean().set('year', year);  // Store year as property
+// //   })
+// // );
+// // // print(ndviAnnualMean, 'NDVI Mean Annual Stack');
+
+// // // Generate median NDVI images per August per year
+// // var ndviAnnualMedian = ee.ImageCollection.fromImages(
+// //   years.map(function(year) {
+// //     var yearCollection = ndvi.filter(ee.Filter.calendarRange(year, year, 'year'));
+// //     return yearCollection.median().set('year', year); // Store year as property
+// //   })
+// // );
+// // // print(ndviAnnualMedian, 'NDVI Median Annual Stack');
+
+// // // Create multiband image stacks for mean and median NDVI
+// // var annualStackMean = ndviAnnualMean.toBands()
+// //   .rename(ndviAnnualMean.aggregate_array('year').map(function(y) {
+// //     return ee.String('NDVI_mean_').cat(ee.Number(y).toInt().format()); 
+// //   }))
+// //   .clip(streams_wide)
+// //   .reproject({crs: 'EPSG:4326', scale: 30});
+
+// // var annualStackMedian = ndviAnnualMedian.toBands()
+// //   .rename(ndviAnnualMedian.aggregate_array('year').map(function(y) {
+// //     return ee.String('NDVI_median_').cat(ee.Number(y).toInt().format()); 
+// //   }))
+// //   .clip(streams_wide)
+// //   .reproject({crs: 'EPSG:4326', scale: 30});
+
+// // // Print the annual NDVI stacks and their nominal scale
+// // print(annualStackMean);
+// // print('Scale (annualStackMean):', annualStackMean.select(0).projection().nominalScale());
+// // print('CRS (annualStackMean):', annualStackMean.select(0).projection().crs());
+
+// // print(annualStackMedian);
+// // print('Scale (annualStackMedian):', annualStackMedian.select(0).projection().nominalScale());
+// // print('CRS (annualStackMedian):', annualStackMedian.select(0).projection().crs());
+
+// // // Count non-masked pixels for each band in annualStackMean
+// // var pixelCountsMean = annualStackMean.reduceRegion({
+// //   reducer: ee.Reducer.count(),
+// //   geometry: streams_wide.geometry(),
+// //   scale: 30,
+// //   maxPixels: 1e13
+// // });
+
+// // // Count non-masked pixels for each band in annualStackMedian
+// // var pixelCountsMedian = annualStackMedian.reduceRegion({
+// //   reducer: ee.Reducer.count(),
+// //   geometry: streams_wide.geometry(),
+// //   scale: 30,
+// //   maxPixels: 1e13
+// // });
+
+// // Print results for annualStackMean
+// //print('Total Pixel Counts per Band in annualStackMean:');
+// //print(pixelCountsMean);
+
+// // Print results for annualStackMedian
+// //print('Total Pixel Counts per Band in annualStackMedian:');
+// //print(pixelCountsMedian);
+
+// // // Visualize example year for visual QA
+// // Map.addLayer(annualStackMean.select('NDVI_mean_2012'), 
+// //             {min: 0, max: 1, palette: ['white', 'green']}, 
+// //             'NDVI Mean 2012');
+             
+
+// // Map.addLayer(annualStackMedian.select('NDVI_median_2012'), 
+// //             {min: 0, max: 1, palette: ['white', 'green']}, 
+// //             'NDVI Median 2012');
+// // **Note the visual gaps in the 2012 NDVI layer due to LandSat 7 failure. Pixels missing 2012 data will be removed from analysis.
+
+// // Print image dates for 2012 AFTER masking (see what remains in streams_wide)
+// // Check how many valid LandSat scenes exist in August 2012 (note, this will not apply to every pixel!!)
+// // var ndvi2012 = ndvi.filter(ee.Filter.calendarRange(2012, 2012, 'year'));
+// // print('NDVI 2012 image count:');
+// // print('NDVI 2012 image dates:',
+// //   ndvi2012.aggregate_array('system:time_start')
+// //           .map(function(t) { return ee.Date(t).format('YYYY-MM-dd'); })
+// // );   /// 3 scenes available for Aug 2012 (at least, in the Bunker Ck basin).
+
+// // // Inspect another year
+// // Map.addLayer(annualStackMean.select('NDVI_mean_2001'), 
+// //               {min: 0, max: 1, palette: ['white', 'green']}, 'NDVI Mean 2001');
+// // Map.addLayer(annualStackMedian.select('NDVI_median_2001'), 
+// //               {min: 0, max: 1, palette: ['white', 'green']}, 'NDVI Median 2001');
+              
+// ////  Choosing between meanNDVI vs medianNDVI... visualize differences b/w mean and median NDVI at various pixels/years
+
+// // var diff1998 = annualStackMean.select('NDVI_mean_1998')
+// //               .subtract(annualStackMedian.select('NDVI_median_1998'))
+// //               .rename('mean_median_diff_1998');
+// // Map.addLayer(diff1998, {min: -0.3, max: 0.3, palette: ['blue', 'white', 'red']}, 'Mean vs Median Diff 1998');
+
+// // var diff2001 = annualStackMean.select('NDVI_mean_2001')
+// //               .subtract(annualStackMedian.select('NDVI_median_2001'))
+// //               .rename('mean_median_diff_2001');
+// // Map.addLayer(diff2001, {min: -0.3, max: 0.3, palette: ['blue', 'white', 'red']}, 'Mean vs Median Diff 2001');
+
+// // var diff2012 = annualStackMean.select('NDVI_mean_2012')
+// //               .subtract(annualStackMedian.select('NDVI_median_2012'))
+// //               .rename('mean_median_diff_2012');
+// // Map.addLayer(diff2012, {min: -0.3, max: 0.3, palette: ['blue', 'white', 'red']}, 'Mean vs Median Diff 2012');
+
+// // var diff2017 = annualStackMean.select('NDVI_mean_2017')
+// //               .subtract(annualStackMedian.select('NDVI_median_2017'))
+// //               .rename('mean_median_diff_2017');
+// // Map.addLayer(diff2017, {min: -0.3, max: 0.3, palette: ['blue', 'white', 'red']}, 'Mean vs Median Diff 2017');
+
+// // var diff2021 = annualStackMean.select('NDVI_mean_2021')
+// //               .subtract(annualStackMedian.select('NDVI_median_2021'))
+// //               .rename('mean_median_diff_2021');
+// // Map.addLayer(diff2021, {min: -0.3, max: 0.3, palette: ['blue', 'white', 'red']}, 'Mean vs Median Diff 2021');
+
+// ////  Conclusion: many pixels exhibit significant differences in NDVI (>0.1 units) when comparing mean vs median. 
+// ////              This is likely due to outliers affecting the mean (such as a hazy day affecting image quality). 
+// ////              Subsequently, I'll be using the median NDVI at every pixel for analysis. 
+
+// // // Rename the final dataset to "annualStack" for consistency with downstream code:
+// // var annualStack = annualStackMedian;
+
+// /////////////////////////////////////////////////////////////////////////////////////////////////////////
+// // =====================================================================================================
+// /////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// ////////////////////////////////////////////////////////////////////////////
+// 8) SAMPLE PIXELS TO OBTAIN LAT/LONG, UNIQUE ID, AND NDVI VALUES
+// ////////////////////////////////////////////////////////////////////////////
+
+// Check projection
+// print('annualStack Projection:', annualStack.projection());  // crs: EPSG:4326
+
+// Sample the annualStack image and retain geometries
+var sampledPixels = annualStack.sample({
+  region: streams_wide.geometry(), // Use the stream geometry as the region of interest
+  scale: 30,                       // Landsat resolution
+  projection: annualStack.projection(), // Retain the original projection
+  geometries: true                 // Keep pixel geometries (lat/lon)
+}).map(function(feature) {
+  
+  // Extract geometry for latitude and longitude
+  var coords = feature.geometry().coordinates();
+  var lat = ee.Number(coords.get(1)); // Extract latitude
+  var lon = ee.Number(coords.get(0)); // Extract longitude
+  
+  // Generate a unique pixel ID using lat/lon
+  var latStr = lat.format('%.7f'); // Format latitude to 7 decimal places
+  var lonStr = lon.format('%.7f'); // Format longitude to 7 decimal places
+  var pixelID = ee.String(latStr).cat('_').cat(lonStr); // Combine lat/lon for unique ID
+  
+  // Add pixel ID, latitude, and longitude to the feature
+  return feature.set({
+    'latitude': lat,   // Add latitude as a property
+    'longitude': lon,  // Add longitude as a property
+    'pixel_ID': pixelID // Add unique pixel ID as a property
+  });
+});
+
+// // Print out the total number of rows (pixels)
+// sampledPixels.size().evaluate(function(totalRows) {
+//   print('Total Number of NDVI Pixels:', totalRows);
+// });
+
+// // Print out the first pixel to check accuracy
+// sampledPixels.first().evaluate(function(firstFeature) {
+//   if (firstFeature) {
+//     // Print the first pixel's dictionary for inspection
+//     var properties = Object.keys(firstFeature.properties);
+//     //print('First NDVI Pixel Properties:', properties);
+
+//     // Print selected attributes for the first pixel
+//     print('Example NDVI Pixel w/ latlong:', {
+//       Pixel_Fields: firstFeature.properties
+//     });
+//   } else {
+//     print('No pixels found in the region.');
+//   }
+// });
+
+//////////////////////////////////////////////////////////////////////////
+/////// 9) SAMPLE PIXELS TO OBTAIN CWD VALUES    ////////////////////////
+//////////////////////////////////////////////////////////////////////////
+
+// =========================================================================
+// ///////     TOPOTERRA CWD DATASET (ANNUAL, 250m RESOLUTION)     /////////
+// =========================================================================
+
+// Check projection:
+//print('CWD Stack Proj:', cwd_annualStack.projection());  //  crs: EPSG:4326
+
+// Resample and reproject CWD to match Landsat 30m grid using bilinear interpolation
+var cwd_resampled = cwd_annualStack
+  .resample('bilinear')                // choose interpolation for when reprojection happens
+  .reproject({                         // force the target grid to be Landsat 30 m
+    crs: refProjection.crs(),
+    scale: 30
+  });
+  
+var sampledPixels = sampledPixels.map(function(feature) {
+  var point = feature.geometry();
+  var cwdValues = cwd_resampled.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 30,
+    crs: refProjection.crs(),          
+    maxPixels: 1e13
+  });
+
+  // Extract keys (band names) and map them to rename "def_YYYY" → "CWD_YYYY_TT"
+  var keys = cwdValues.keys();
+  var renamedCWD = keys.map(function(k) {
+  return ee.String(k).replace('def_', 'CWD_').cat('_TT');
+  });
+
+  // Create a dictionary with the renamed keys and corresponding values
+  var annualCWD = ee.Dictionary.fromLists(renamedCWD, cwdValues.values());
+
+  return feature.set(annualCWD);
+});
+
+// Print out the total number of rows (pixels)
+sampledPixels.size().evaluate(function(totalRows) {
+  print('Total Number of NDVI/CWD Pixels:', totalRows);
+});
+
+// // Print out the first pixel with the annual CWD values to check accuracy
+// sampledPixels.first().evaluate(function(firstFeature) {
+//   if (firstFeature) {
+//     // Print the first pixel's dictionary for inspection
+//     var properties = Object.keys(firstFeature.properties);
+//     print('First TT CWD Pixel Properties:', properties);
+
+//     // Print selected attributes for the first pixel
+//     print('Example TT CWD Pixel:', {
+//       Pixel_Fields: firstFeature.properties
+//     });
+//   } else {
+//     print('No pixels found in the region.');
+//   }
+// });
+
+////////////////////////////////////////////////////////////////////////
+//////////////  30-YEAR CLIMATE WATER DEFICIT (TOPOTERRA):      ////////
+////////////////////////////////////////////////////////////////////////
+///// Using pre-calculated 30-yr normal from TopoTerra, 1985-2015
+
+// Check projection:
+// print('CWD Projection:', cwd_30.projection());    // crs: EPSG:4326
+
+// Rename the cwd_30 bands according to the ArcGIS Pro metadata
+var cwd_30 = cwd_30.select(
+  ['b1', 'b2', 'b3', 'b4'],  // Original GEE band names
+  ['aet', 'def', 'tmax', 'tmin']  // Correct names via ArcGIS Pro
+);
+// 'def' band is the 30-yr average climate water deficit (avgd across 1985-2015) 
+// print('30Yr Avg CWD Properties:', cwd_30)
+
+// Isolate the climate water deficit ("def") band from the raster file:
+var cwd_30 = cwd_30.select('def');
+
+// Resample; clip geometry; name the final band
+var cwdResampled = cwd_30
+  .resample('bilinear')
+  .clip(focalHUC.geometry())
+  .rename("cwd_30yrAvg_TT");
+  
+// ADD TOPOTERRA 30-YEAR MEAN CWD TO PIXELS
+var sampledPixels = sampledPixels.map(function(feature) {
+  var point = feature.geometry();
+
+  var cwd30 = cwdResampled.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 30,
+    crs: refProjection.crs(),
+    maxPixels: 1e13
+  });
+
+  // Explicitly attaches: cwd_30yrAvg_TT
+  return feature.set(cwd30);
+});
+
+//// ===== VISUALIZATION:  
+//// Compute min and max avgCWD values over the region
+var CWD_avg_stats = cwdResampled.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: focalHUC.geometry(),
+  scale: 247,  // Native scale for TT CWD
+  maxPixels: 1e13
+});
+
+// Print the computed Avg CWD range
+CWD_avg_stats.evaluate(function(stats) {
+  print('AvgCWD Min Value:', stats.cwd_30yrAvg_TT_min);  // 85.45809173583984
+  print('AvgCWD Max Value:', stats.cwd_30yrAvg_TT_max);  // 517.6572265625
+});
+
+// // Define visualization parameters for AvgCWD based on def min/max
+// var AvgCWDVizParams = {
+//   min: 50,
+//   max: 600,
+//   palette: ['blue', 'cyan', 'green', 'yellow', 'orange', 'red']
+// };
+
+// //Add the resampled Average CWD layer to the map
+// Map.addLayer(cwdResampled, AvgCWDVizParams, '30-Year Avg CWD');
+
+// Map.addLayer(huc12, {}, 'huc12');
+// Map.addLayer(streams_wide, {color: 'red'}, 'streams');
+
+//// =====  QA CHECK =====
+sampledPixels
+  .limit(5)
+  .aggregate_array('cwd_30yrAvg_TT')
+  .evaluate(function(vals) {
+    print('Example TT 30yr Avg CWD values:', vals);
+  });
+
+// =====================================================================================
+// /////// TERRACLIMATE AET+CWD+SWE+PRE+TMX DATASET (MONTHLY, 4.6km RESOLUTION) ////////
+// =====================================================================================
+
+// IMPORTANT: .reproject() function sets the grid only; it does NOT default to bilinear resample.
+// The resampling kernel is controlled by .resample(...) function, and it defaults to 'nearest'
+// For sampling at 30 m, do: img.resample('bilinear'); then reduceRegion(..., scale: 30).
+// Only use .reproject({crs, scale}) if you need to force a new grid for a raster output.
+
+//// ////////////////////////////////////////////////////////
+//// TerraClimate AET (Monthly Averages: Mar–Aug, 1984–2024)              
+//// ////////////////////////////////////////////////////////
+
+// Define year and month ranges
+var startYear = 1984;
+var endYear   = 2024;
+var years = ee.List.sequence(startYear, endYear);
+var months = ee.List.sequence(3, 8);  // March to August  (Jan/Feb were 0's)
+
+// Generate ImageCollection of AET images.  
+var monthlyAETcollection = ee.ImageCollection.fromImages(
+  years.map(function(y) {
+    y = ee.Number(y);
+    return months.map(function(m) {
+      m = ee.Number(m);
+      var paddedMonth = m.format('%02d');
+      var bandName = ee.String('AET_')
+        .cat(y.format('%d'))
+        .cat(paddedMonth)
+        .cat('_TC');
+
+      return ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+        .filter(ee.Filter.calendarRange(m, m, 'month'))
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .select('aet')
+        .first()
+        // .reproject(...)  // <-- keep commented; we’ll sample on Landsat grid later
+        .set('system:index', bandName);
+    });
+  }).flatten()
+);
+
+// Stack and clean band names
+var tcAET_AnnualMonthlyStack = monthlyAETcollection.toBands();
+var cleanedAET = tcAET_AnnualMonthlyStack.rename(
+  tcAET_AnnualMonthlyStack.bandNames().map(function(name) {
+    return ee.String(name).replace('_aet', '');
+  })
+);
+
+// Add to map for visualization:
+var tcAET_Clipped = cleanedAET.clip(streams_wide);
+// Map.addLayer(tcAET_Clipped.select('AET_200508_TC'), {min: 300, max: 550}, 'AET August 2005');
+
+// //////////////////////////////////////////////////////////////////
+// //// TerraClimate DEF (CWD) — Monthly Averages: Jan–Aug, 1984–2024         
+// //////////////////////////////////////////////////////////////////
+
+// Define year and month ranges
+var startYear = 1984;
+var endYear   = 2024;
+var years = ee.List.sequence(startYear, endYear);
+var months = ee.List.sequence(1, 8);  // January to August
+
+// Generate ImageCollection of CWD images — formatting: CWD_MMYYYY_TC
+// Build monthly CWD images; keep native TC grid here (no reproject)
+var monthlyCWDcollection = ee.ImageCollection.fromImages(
+  years.map(function(y) {
+    y = ee.Number(y);
+    return months.map(function(m) {
+      m = ee.Number(m);
+      var paddedMonth = m.format('%02d');
+      var bandName = ee.String('CWD_')
+        .cat(y.format('%d'))
+        .cat(paddedMonth)
+        .cat('_TC');
+        
+      return ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .filter(ee.Filter.calendarRange(m, m, 'month'))
+        .select('def')
+        .sort('system:time_start')  // defensive; ensures deterministic .first()
+        .first()
+        .set('system:index', bandName);
+    });
+  }).flatten()
+);
+
+// Stack and clean band names (drop the TerraClimate suffix)
+var tcCWD_AnnualMonthlyStack = monthlyCWDcollection.toBands();
+var cleanedCWD = tcCWD_AnnualMonthlyStack.rename(
+  tcCWD_AnnualMonthlyStack.bandNames().map(function(name) {
+    return ee.String(name).replace('_def', '');
+  })
+);
+
+// Visualize on the map:
+var tcCWD_Clipped = cleanedCWD.clip(focalHUC);
+//Map.addLayer(tcCWD_Clipped.select('CWD_201207_TC'), {min: 800, max: 1300}, 'CWD July 2012');
+
+//////////////////////////////////////////////////////////////////
+/// TerraClimate SWE — Monthly Averages: Jan–May, 1984–2024
+//////////////////////////////////////////////////////////////////
+
+// Define year and month ranges
+var startYear = 1984;
+var endYear   = 2024;
+var years  = ee.List.sequence(startYear, endYear);
+var months = ee.List.sequence(1, 5);  // January to May
+
+// Build monthly SWE images (keep native grid; no reproject yet)
+var monthlySWEcollection = ee.ImageCollection.fromImages(
+  years.map(function(y) {
+    y = ee.Number(y);
+    return months.map(function(m) {
+      m = ee.Number(m);
+      var paddedMonth = m.format('%02d');
+      var bandName = ee.String('SWE_')
+        .cat(y.format('%d'))   // Year 
+        .cat(paddedMonth)      // Month
+        .cat('_TC');
+
+      return ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+        .filter(ee.Filter.calendarRange(y, y, 'year'))
+        .filter(ee.Filter.calendarRange(m, m, 'month'))
+        .select('swe')  // snow water equivalent
+        .sort('system:time_start')  // defensive: ensure deterministic .first()
+        .first()
+        .set('system:index', bandName);
+    });
+  }).flatten()
+);
+
+// Stack and clean band names
+var tcSWE_AnnualMonthlyStack = monthlySWEcollection.toBands();
+var cleanedSWE = tcSWE_AnnualMonthlyStack.rename(
+  tcSWE_AnnualMonthlyStack.bandNames().map(function(name) {
+    return ee.String(name).replace('_swe', '');
+  })
+);
+
+// Optional visualization
+var tcSWE_Clipped = cleanedSWE.clip(focalHUC);
+// Map.addLayer(tcSWE_Clipped.select('SWE_201004_TC'), {min: 0, max: 100}, 'SWE April 2010');
+
+// /////////////////////////////////////////////////////////////////////////
+// /// TerraClimate Precipitation (PRE) — Monthly Totals: Jan–Aug, 1984–2024
+// /////////////////////////////////////////////////////////////////////////
+
+// // Define year and month ranges
+// var startYear = 1984;
+// var endYear   = 2024;
+// var years = ee.List.sequence(startYear, endYear);
+// var months = ee.List.sequence(1, 8);  // January to August
+
+// // Generate ImageCollection of precipitation images — formatting: PR_MMYYYY_TC
+// var monthlyPRcollection = ee.ImageCollection.fromImages(
+//   years.map(function(y) {
+//     y = ee.Number(y);
+//     return months.map(function(m) {
+//       m = ee.Number(m);
+//       var paddedMonth = m.format('%02d');
+//       var bandName = ee.String('PRE_')
+//         .cat(y.format('%d'))   // Year first
+//         .cat(paddedMonth)      // Then month
+//         .cat('_TC');
+
+//       return ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+//         .filter(ee.Filter.calendarRange(y, y, 'year'))
+//         .filter(ee.Filter.calendarRange(m, m, 'month'))
+//         .select('pr')  // total monthly precip (mm)
+//         .sort('system:time_start') // defensive
+//         .first()
+//         .set('system:index', bandName);
+//     });
+//   }).flatten()
+// );
+
+// // Stack into multi-band image and adjust band names
+// var tcPR_AnnualMonthlyStack = monthlyPRcollection.toBands();
+// var cleanedPRE = tcPR_AnnualMonthlyStack.rename(
+//   tcPR_AnnualMonthlyStack.bandNames().map(function(name) {
+//     return ee.String(name).replace('_pr', '');
+//   })
+// );
+
+// // Clip and Visualize:
+// var tcPR_Clipped = cleanedPRE.clip(focalHUC);
+// Map.addLayer(tcPR_Clipped.select('PR_201204_TC'), {min: 0, max: 150}, 'Precip April 2012');
+
+// /////////////////////////////////////////////////////////////////////////////
+// /// TerraClimate Max Temperature — Monthly Max Daily Tmax: Jan–Aug, 1984–2024
+// /////////////////////////////////////////////////////////////////////////////
+
+// //// Note, these values are scaled, meaning they represent degreesC x 10 for easier storage of decimal data. 
+// //// So a value of 109 equals 10.9 degrees C.
+
+// // Define year and month ranges
+// var startYear = 1984;
+// var endYear   = 2024;
+// var years = ee.List.sequence(startYear, endYear);
+// var months = ee.List.sequence(1, 8);  // January to August
+
+// // Generate ImageCollection of tmmx images — formatting: TMMX_MMYYYY_TC
+// var monthlyTMMXcollection = ee.ImageCollection.fromImages(
+//   years.map(function(y) {
+//     y = ee.Number(y);
+//     return months.map(function(m) {
+//       m = ee.Number(m);
+//       var bandName = ee.String('TMX_')
+//         .cat(y.format('%d'))      // YYYY
+//         .cat(m.format('%02d'))    // MM
+//         .cat('_TC');
+
+//       return ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+//         .filter(ee.Filter.calendarRange(y, y, 'year'))
+//         .filter(ee.Filter.calendarRange(m, m, 'month'))
+//         .select('tmmx')           // max daily Tmax in month (°C × 10)
+//         .sort('system:time_start')
+//         .first()
+//         .set('system:index', bandName);
+//     });
+//   }).flatten()
+// );
+
+// // Stack into multi-band image; Remove '_tmmx' from band names
+// var tcTMMX_AnnualMonthlyStack = monthlyTMMXcollection.toBands();
+// var cleanedTMX = tcTMMX_AnnualMonthlyStack.rename(
+//   tcTMMX_AnnualMonthlyStack.bandNames().map(function(name) {
+//     return ee.String(name).replace('_tmmx', '');
+//   })
+// );
+
+// Clip and visualize:
+//var tcTMX_Clipped = cleanedTMX.clip(streams_wide);
+//Map.addLayer(tcTMX_Clipped.select('TMX_201806_TC'), {min: 200, max: 400}, 'Max Temp June 2018');
+
+// note - - add QA print statements throughout these TC sections. check number of output properties vs exp. 
+
+
+///  ================================================================================
+///  ADD 5 TERRACLIMATE VARIABLES (MONTHLIES) TO EXISTING PIXELS: AET, CWD, SWE, PRE, TMMX
+
+// Resample once (bilinear)
+var tcAET_resampled   = cleanedAET.resample('bilinear');
+var tcCWD_resampled   = cleanedCWD.resample('bilinear');
+var tcSWE_resampled   = cleanedSWE.resample('bilinear');
+// var tcPRE_resampled   = cleanedPRE.resample('bilinear');
+// var tcTMX_resampled   = cleanedTMX.resample('bilinear');
+
+var sampledPixels = sampledPixels.map(function(feature) {
+  var point = feature.geometry();
+  
+  // One reduceRegion per stack, at 30 m in the Landsat CRS
+  // AET
+  var aetValues = tcAET_resampled.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 30,
+    crs: refProjection.crs(),
+    maxPixels: 1e13
+  });
+
+  // CWD
+  var cwdValues = tcCWD_resampled.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 30,
+    crs: refProjection.crs(),
+    maxPixels: 1e13
+  });
+
+  // SWE
+  var sweValues = tcSWE_resampled.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 30,
+    crs: refProjection.crs(),
+    maxPixels: 1e13
+  });
+
+  // // PRE         // commenting this out for now, due to switching to PRISM precip data.
+  // var preValues = tcPRE_resampled.reduceRegion({
+  //   reducer: ee.Reducer.first(),
+  //   geometry: point,
+  //   scale: 30,
+  //   crs: refProjection.crs(),
+  //   maxPixels: 1e13
+  // });
+
+  // // TMX       // commenting this out for now, due to switching to PRISM temp data.
+  // var tmmxValues = tcTMX_resampled.reduceRegion({
+  //   reducer: ee.Reducer.first(),
+  //   geometry: point,
+  //   scale: 30,
+  //   crs: refProjection.crs(),
+  //   maxPixels: 1e13
+  // });
+
+  // Set all five climate variables
+  return feature
+    .set(aetValues)
+    .set(cwdValues)
+    .set(sweValues);
+    //.set(preValues)
+    //.set(tmmxValues);
+});
+
+// // // QA check — print one example
+// // sampledPixels.first().evaluate(function(pixel) {
+// //   if (pixel) {
+// //     var keys = Object.keys(pixel.properties);
+// //     print('First pixel w TC attributes:', pixel.properties);
+// //   } else {
+// //     print('No pixel values extracted.');
+// //   }
+// // });
+
+
+/////////////////////////////////////////////////////////////////////////
+/// Add TerraClimate 30-Year Monthly Mean CWD (Apr–Aug) to Sampled Pixels
+/////////////////////////////////////////////////////////////////////////
+
+//  ===================================================
+/// 30-Year Mean CWD for Each Month (Apr–Aug, 1986–2015)
+//  ===================================================
+
+// Define range of years for climatology
+var climYears = ee.List.sequence(1986, 2015);
+var months = ee.List.sequence(4, 8);  // April to August
+
+// Function to get monthly mean CWD image (across years) for a given month
+var makeMonthlyCWDMean = function(month) {
+  month = ee.Number(month);
+  var paddedMonth = month.format('%02d');
+
+  var monthlyImages = climYears.map(function(year) {
+    year = ee.Number(year);
+    return ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+      .filter(ee.Filter.calendarRange(year, year, 'year'))
+      .filter(ee.Filter.calendarRange(month, month, 'month'))
+      .select('def')
+      .first();  // Grab the first image for that month/year
+  });
+
+  // Compute mean image and rename band
+  var meanImg = ee.ImageCollection.fromImages(monthlyImages)
+    .mean()
+    .reproject({crs: refProjection.crs(), scale: 30})
+    .rename(ee.String('cwd_30yrAvg_TC_').cat(paddedMonth));
+
+  return meanImg;
+};
+
+// Create a list of 5 mean images (one per month)
+var monthlyCWDMeans = ee.ImageCollection.fromImages(
+  months.map(makeMonthlyCWDMean)
+);
+
+// Stack them into a multi-band image
+var cwdMonthlyMeansStack = monthlyCWDMeans.toBands();
+
+// Manually remove the index prefix (e.g., '0_', '1_') from band names
+cwdMonthlyMeansStack = cwdMonthlyMeansStack.rename(
+  cwdMonthlyMeansStack.bandNames().map(function(name) {
+    // Remove everything up to and including the first underscore
+    return ee.String(name).split('_').slice(1).join('_');
+  })
+);
+
+// Visual check:
+// Map.addLayer(cwdMonthlyMeansStack.select('cwd_30yrAvg_TC_07'), {min: 800, max: 1300}, 'CWD 30yr Mean July');
+
+// Resample to match Landsat grid
+var cwdMonthlyMeans_resampled = cwdMonthlyMeansStack.resample('bilinear');
+
+// Add 5 monthly mean CWD bands to each pixel
+var sampledPixels = sampledPixels.map(function(feature) {
+  var point = feature.geometry();
+
+  var cwdMeans = cwdMonthlyMeans_resampled.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 30,
+    crs: refProjection.crs(),
+    maxPixels: 1e13
+  });
+
+  return feature.set(cwdMeans);
+});
+
+// QA check — print one feature to verify columns
+sampledPixels.first().evaluate(function(pixel) {
+  if (pixel) {
+    var keys = Object.keys(pixel.properties);
+    print('Pixel with all TerraClimate variables:', keys);
+    print('Pixel Properties:', pixel.properties);
+  } else {
+    print('No pixel values extracted.');
+  }
+});
+
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////       PREPARING PRISM DATA: PRECIP, TMAX, TMEAN (~800m resolution, Monthly)        /////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// =======================  PREPARE MONTHLY PRISM DATA   =======================
+// Starting with:
+//   - pptFull, tmaxFull, tmeanFull  (each 328 bands, named e.g. "ppt_YYYYMM")
+//   - sampledPixels   (latest FeatureCollection to map over)
+//   - refProjection assigned above in the TerraClimate section (set to annualStack projection)
+
+var tempsAsCelsius = false; // true => convert PRISM temps from °C*100 to °C
+
+// Define variable names and their resampling technique (bilinear interpolation). Reprojection occurs further below (during 'reduceRegion)
+var prism_ppt   = pptFull.resample('bilinear');
+var prism_tmax  = (tempsAsCelsius ? tmaxFull.divide(100) : tmaxFull).resample('bilinear');
+var prism_tmean = (tempsAsCelsius ? tmeanFull.divide(100) : tmeanFull).resample('bilinear');
+
+// RENAME BANDS:
+// Function to strip the old prefix and rebuild as <var>_YYYYMM_PR
+function renameBands(image, varName) {
+  var oldNames = image.bandNames();  // e.g., ["ppt_198401", "ppt_198402", ...]
+  var newNames = oldNames.map(function(k) {
+    var yyyymm = ee.String(k).replace(varName + '_', '');
+    return ee.String(varName).cat('_').cat(yyyymm).cat('_PR');
+  });
+  return image.rename(newNames);
+}
+
+// Apply once to each stack
+prism_ppt   = renameBands(prism_ppt, 'ppt');
+prism_tmax  = renameBands(prism_tmax, 'tmax');
+prism_tmean = renameBands(prism_tmean, 'tmean');
+
+// ================================================================================================================
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// 10) ADD/INSPECT FIRE INFO, HUC12, TOPOGRAPHIC WETNESS INDEX (TWI), HLI
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// // Print out all CRS for layer inspection
+// print('annualStack Projection:', annualStack.projection());  // crs: EPSG:4326
+// print ('sev projection:', severity.projection());  // crs: EPSG:4326
+// print('HUC12 Projection:', huc12.geometry().projection());  // crs: EPSG:4326
+// print('Fire Atlas Projection:', fire_atlas.geometry().projection());  // crs: EPSG:4326
+
+/////////////////////////////////////////////////////////////////////////////
+//////////////// Topographic Wetness Index (TWI)      ///////////////////////
+/////////////////////////////////////////////////////////////////////////////
+
+// // Check projection:
+// // print('TWI projection:', twi.projection());    // PROJCS["NAD_1983_Albers"
+
+// Resample TWI using bilinear interpolation 
+  var twiResampled = twi
+    .resample('bilinear')
+    .rename("twi");
+
+//print('Band names - TWI:', twiResampled.bandNames());
+
+// // === VISUALIZATION:
+
+// // Compute min and max TWI values over the region
+// var twiStats = twiResampled.reduceRegion({
+//   reducer: ee.Reducer.minMax(),
+//   geometry: focalHUC.geometry(),
+//   scale: 30,
+//   crs: refProjection.crs(),  // reproject to LandSat CRS (for map viewing only)
+//   maxPixels: 1e13
+// });
+
+// // Print the computed TWI range
+// twiStats.evaluate(function(stats) {
+//   print('TWI Min Value:', stats.twi_min);  // TWI Min Value: 304
+//   print('TWI Max Value:', stats.twi_max);  // TWI Max Value: 1399
+// });
+
+// // Define visualization parameters for TWI based on min/max
+// var twiVizParams = {
+//   min: 300,
+//   max: 1400, 
+//   palette: ['red', 'orange', 'yellow', 'green', 'cyan', 'blue']
+// };
+
+// //Add the reprojected, resampled, and clipped TWI layer to the map
+// Map.addLayer(twiResampled, twiVizParams, 'TWI');
+// Map.addLayer(streamNetwork, {}, 'streams');
+
+////////////////////////////////////////////////////////////////////////
+////////////////  HEAT LOAD INDEX:   ///////////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
+// Check projection:
+// print('HLI Projection:', hli.projection());    // PROJCS["NAD_1983_Albers"
+
+// Resample HLI using bilinear interpolation and clip to focal HUC
+var hliResampled = hli
+  .rename('hli')                 
+  .resample('bilinear');          
+  
+// print('Band names - HLI:', hliResampled.bandNames());
+
+/// =====   VISUALIZATION:
+
+// Compute min and max HLI values over the region
+var hliStats = hliResampled.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: huc12.geometry(),
+  scale: 30,
+  crs: refProjection.crs(),
+  maxPixels: 1e13
+});
+
+// // Print the computed HLI range
+// hliStats.evaluate(function(stats) {
+//   print('HLI Min Value:', stats.hli_min);   // HLI Min Value: 691
+//   print('HLI Max Value:', stats.hli_max);   // HLI Max Value: 10000
+// });
+
+// Define visualization parameters for HLI based on min/max
+var hliVizParams = {
+  min: 690,
+  max: 10000,
+  palette: ['blue', 'cyan', 'green', 'yellow', 'orange', 'red']
+};
+
+// Add the reprojected, resampled HLI layer to the map
+// Map.addLayer(hliResampled, hliVizParams, 'HLI');
+
+// ////////////////////////////////////////////////////////////////////////
+// /////////////////////      FIRE SEVERITY:       ////////////////////////
+// ////////////////////////////////////////////////////////////////////////
+
+// // Print severity projection, CRS, and resolution:
+// // print('Severity Projection:', severity.projection());   // crs: EPSG:4326
+// // print('Severity Nominal Scale (Resolution):', severity.projection().nominalScale());  // 29.9999999835846
+// // Map.addLayer(severity, {}, 'Burn Severity')
+
+var severity30 = severity
+  .resample('bilinear')
+  .reproject({ crs: refProjection.crs(), scale: 30 })
+  .rename('sev_num');
+
+var sevCannon30 = severity_Cannon
+  .resample('bilinear')
+  .reproject({ crs: refProjection.crs(), scale: 30 })
+  .rename('sev_cannon_num');
+
+// // Get a list of unique pixel values (sampled across the image)
+// var uniqueValues = severity.reduceRegion({
+//   reducer: ee.Reducer.frequencyHistogram(),
+//   geometry: severity.geometry(),
+//   scale: 30,
+//   crs: refProjection.crs(),
+//   bestEffort: true
+// });
+
+// print('Unique Sev Pixel Values:', uniqueValues);
+
+// // Ensure severity raster is masked only where No Data exists (e.g., -1 values if present)
+var severityMasked = severity.updateMask(severity.neq(-1));
+
+// Categorize raster values into specific fire severity classes
+var classifiedSeverity = severityMasked.expression(
+  "(b(0) >= 0) * (b(0) < 0.1) * 0 + " +   // Unburned or very low severity (gray)
+  "(b(0) >= 0.1) * (b(0) < 1.25) * 1 + " + // Low severity (yellow)
+  "(b(0) >= 1.25) * (b(0) < 2.25) * 2 + " + // Moderate severity (orange)
+  "(b(0) >= 2.25) * 3",  // High severity (red)
+  {
+    'b(0)': severityMasked // Reference masked raster
+  }
+);
+
+// Visualization parameters for classified raster
+var classifiedVis = {
+  min: 0,
+  max: 3,
+  palette: ['gray', 'yellow', 'orange', 'red'] // Reflects Parks et al classification
+};
+
+// // Add the classified fire severity layer to the map
+// Map.addLayer(classifiedSeverity, classifiedVis, 'Classified Fire Severity (Masked)');
+
+//////////////////////////////////////////////////////////////////////////
+////////////////////       NUMBER OF BURNS:          ////////////////////
+//////////////////////////////////////////////////////////////////////////
+
+// Print projection and scale of num_times_burned - - Concluded that I do NOT need to reproject this layer prior to extraction
+// print('num_times_burned Projection:', num_times_burned.projection());  // crs: EPSG:4326
+// print('num_times_burned Scale:', num_times_burned.projection().nominalScale());  // num_times_burned Scale: 29.999999977523704 
+
+//print('NO. Of Burns Properties:', num_times_burned);
+
+// Reduce the image to get unique values and their frequencies
+var uniqueValues = num_times_burned.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(), 
+  geometry: num_times_burned.geometry(), 
+  scale: 30,
+  crs: refProjection.crs(),
+  maxPixels: 1e13
+});
+
+// Extract the dictionary of unique values
+var uniqueValuesDict = ee.Dictionary(uniqueValues.get('b1'));
+
+// Get only the unique keys (pixel values)
+var uniquePixelValues = uniqueValuesDict.keys();
+
+// Print unique pixel values to the console
+print('Unique NTB Pixel Values:', uniquePixelValues);  // Unique NTB Pixel Values: ["0","1","2","3","4"]
+
+// =========================================================================================================================
+
+//////////////////////////////////////////////////////////////////////////////////
+//  11) ANNOTATING SAMPLED PIXELS W/ ENV AND FIRE ATTRIBUTES    //////////////////
+//////////////////////////////////////////////////////////////////////////////////
+
+var sampledWithAttributes = sampledPixels.map(function(feature) {
+  var point = feature.geometry();
+  
+  // sample a single pixel; buffer slightly to avoid vertex/edge weirdness
+  var sampleGeom = point.buffer(10); // pixel edge buffer, in m
+  
+  // Fire Severity (numeric)
+  var severityValue = severity30.reduceRegion({
+    reducer: ee.Reducer.mean(),   
+    geometry: sampleGeom,
+    scale: 30,
+    maxPixels: 1e13
+  }).get('sev_num'); 
+  
+  // Extract severity value from severity_Cannon layer
+  var severityCannonValue = sevCannon30.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: sampleGeom,
+    scale: 30,
+    maxPixels: 1e13
+  }).get('sev_cannon_num');
+
+  // Assign severity class based on Parks et al. classification:
+  var sevClass = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(severityValue, null), 'None',  // Class null sev values as 'None'
+      ee.Algorithms.If(
+          ee.Number(severityValue).lt(0.1), 'Unburned/Very Low',  // CBI 0.0 – 0.1
+          ee.Algorithms.If(
+              ee.Number(severityValue).lt(1.25), 'Low',           // CBI 0.1 – 1.25
+              ee.Algorithms.If(
+                  ee.Number(severityValue).lt(2.25), 'Moderate',  // CBI 1.25 – 2.25
+                  'High'                                          // CBI 2.25 – 3.0+
+              )
+          )
+      )
+  );
+
+  var twiValue = twiResampled.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: sampleGeom,
+    scale: 30,
+    crs: refProjection.crs(),
+    bestEffort: true
+  }).get('twi');
+
+  var hliValue = hliResampled.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: sampleGeom,
+    scale: 30,
+    crs: refProjection.crs(),
+    bestEffort: true
+  }).get('hli');
+
+  var cwdValue = cwdResampled.reduceRegion({  // TopoTerra dataset
+    reducer: ee.Reducer.mean(),
+    geometry: feature.geometry(),
+    scale: 30,
+    crs: refProjection.crs(),
+    bestEffort: true
+  }).get('cwd_30yrAvg_TT');
+  
+  var numBurnValue = num_times_burned.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: feature.geometry(),
+    scale: 30,
+    crs: refProjection.crs(),
+    bestEffort: true
+  }).get('b1');  
+
+  // Extract nearest stream feature based on the pixel location
+  var nearestStream = streams_wide.filterBounds(feature.geometry()).first();
+  var fcode = ee.Algorithms.If(nearestStream, nearestStream.get('FCODE'), null);
+  var comid = ee.Algorithms.If(nearestStream, nearestStream.get('COMID'), null);
+
+  // -------------------------------
+  // Note: TerraClimate monthly values were already added in earlier code
+  // -------------------------------
+  
+  // -------------------------------
+  // PRISM monthly values
+  // -------------------------------
+  
+  var pptValues = prism_ppt.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 30,
+    crs: refProjection.crs(),
+    maxPixels: 1e13
+  });
+
+  var tmaxValues = prism_tmax.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 30,
+    crs: refProjection.crs(),
+    maxPixels: 1e13
+  });
+
+  var tmeanValues = prism_tmean.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: point,
+    scale: 30,
+    crs: refProjection.crs(),
+    maxPixels: 1e13
+  });
+
+  // Add to feature 
+  return addFireInfo(
+    addHUC12Name(
+      feature
+        .set('sev_num', severityValue)
+        .set('sev_cannon_num', severityCannonValue)
+        .set('sev_class', sevClass)
+        .set('twi', twiValue)
+        .set('hli', hliValue)
+        .set('cwd_30yrAvg_TT', cwdValue)   
+        .set('num_of_burns', numBurnValue)
+        .set('FCODE', fcode)
+        .set('COMID', comid)
+        // PRISM monthlies 
+        .set(pptValues)
+        .set(tmaxValues)
+        .set(tmeanValues)
+    )
+  );
+});
+
+
+// ////////////////////////////////////////////////////////////////////////////
+// 12) PERFORM QA
+//////////////////////////////////////////////////////////////////////////////
+
+// // map visualization (Geometry only - no properties)
+// var sampledWithAttributes = sampledWithAttributes.filterBounds(streams_wide.geometry());
+// Map.addLayer(streams_wide, {color: 'white'}, 'Streams');
+// Map.addLayer(focalHUC, {color: 'black'}, 'Watersheds');
+// Map.addLayer(sampledWithAttributes.style({color: 'FF0000', pointSize: 3}), {}, 'Sampled pixels on streams');
+
+// Print out the first pixel to check accuracy
+sampledWithAttributes.first().evaluate(function(feature) {
+  if (feature) {
+    print('Example Output Pixel with Attributes:', feature);
+  } else {
+    print('No pixels found in the region.');
+  }
+});
+
+// // Retrieve another feature from sampledWithAttributes to check accuracy
+// var feature100 = sampledWithAttributes.toList(100).get(99);
+// print('Feature 100:', feature100);
+
+// // Print total number of output rows (pixels)
+// sampledWithAttributes.size().evaluate(function(totalPixels) {
+//   print('Total Number of Output Pixels:', totalPixels);
+// });
+
+// // // Add the sampled pixel points to the map
+// // Map.addLayer(sampledWithAttributes, {color: 'black'}, 'Sampled Pixels');
+// // Map.addLayer(streams_wide, {color: 'white'}, 'streams');
+// // // Map.addLayer(fire_atlas, {}, 'Fire Atlas');
+
+// // // More lightweight (faster) versions for quick visualization on map:
+
+// // // Option 1: RASTER LAYER - Add a dummy property with value 1 to all features
+// // var sampledRaster = sampledWithAttributes.map(function(feature) {
+// //   return feature.set('constant', 1);
+// // }).reduceToImage({
+// //   properties: ['constant'],
+// //   reducer: ee.Reducer.first() // Assign value of 1 to all sampled pixels
+// // }).selfMask(); // Mask out areas where there are no sampled pixels
+// // // Add raster layer to map
+// // Map.addLayer(streams_wide, {color: 'white'}, 'streams');
+// // // Draw sampled points as larger yellow circles
+// // Map.addLayer(sampledWithAttributes.style({
+// //   color: 'yellow',
+// //   pointSize: 6,   // increase this value to make symbols bigger
+// //   width: 0
+// // }), {}, 'Sampled With Attributes');
+
+// // // Option 2 (faster) - point layer
+// // // Extract only the geometries of sampled pixels (drop all attributes)
+// // var sampledGeometries = sampledWithAttributes.map(function(feature) {
+// //   return ee.Feature(feature.geometry());
+// // });
+
+// // // Add lightweight point layer to the map
+// // Map.addLayer(sampledGeometries, {color: 'red'}, 'Sampled Pixel Locations');
+
+
+// ////////////////////////////////////////////////////////////////////////////
+// // 13) EXPORT FINAL PRODUCTS TO GOOGLE DRIVE
+// ////////////////////////////////////////////////////////////////////////////
+
+// Export.table.toDrive({
+//   collection: sampledWithAttributes,
+//   description: 'Bartlett',
+//   folder: 'CSVs',
+//   fileNamePrefix: 'Bartlett',
+//   fileFormat: 'CSV'
+//   });
